@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/
+
+# OS / temp
+Thumbs.db
+.DS_Store
+_*.log
+_paper_text.txt
