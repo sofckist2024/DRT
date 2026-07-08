@@ -66,16 +66,29 @@ def make_tau_grid(freq: np.ndarray, ppd: int = 10, extend_decades: float = 1.0
 # --------------------------------------------------------------------------- #
 #  Kernel and regularization matrices
 # --------------------------------------------------------------------------- #
-def build_kernel(freq: np.ndarray, tau: np.ndarray, fit_r_inf: bool = True
-                 ) -> Tuple[np.ndarray, float]:
-    """Real stacked kernel A (2N x (M[+1])) and the ln-tau spacing dlntau.
+def n_extra_cols(fit_r_inf: bool, fit_ind: bool) -> int:
+    """Number of non-distribution columns: R_inf (1) + inductance (2, ±)."""
+    return (1 if fit_r_inf else 0) + (2 if fit_ind else 0)
+
+
+def build_kernel(freq: np.ndarray, tau: np.ndarray, fit_r_inf: bool = True,
+                 fit_ind: bool = True) -> Tuple[np.ndarray, float]:
+    """Real stacked kernel A (2N x (M + extra)) and the ln-tau spacing dlntau.
 
     Row block 1 = real part, row block 2 = imaginary part of
 
         A_col_m(w_n) = dlntau / (1 + j w_n tau_m).
 
-    When `fit_r_inf` an extra unpenalised column (ones in the real block,
-    zeros in the imaginary block) lets the ohmic offset R_inf be fitted too.
+    Extra unpenalised columns (appended after the M distribution columns):
+
+    * `fit_r_inf`: the ohmic offset R_inf  (ones in real block, zeros in imag).
+    * `fit_ind`:   a series inductance  Z = j w L, split into TWO non-negative
+      columns (+w and -w in the imag block) so the net L = x_+ - x_- can take
+      either sign. This lets the DRT absorb any residual inductance left in the
+      spectrum — essential, because the pure DRT kernel 1/(1+jwt) can only
+      produce capacitive (Z'' < 0) response and cannot represent an inductive
+      tail. Without it, leftover inductive points inflate the misfit floor and
+      the L-curve corner collapses to a hugely over-smoothed k_reg.
     """
     w = 2.0 * np.pi * np.asarray(freq, float)
     tau = np.asarray(tau, float)
@@ -86,20 +99,28 @@ def build_kernel(freq: np.ndarray, tau: np.ndarray, fit_r_inf: bool = True
     k_real = (1.0 / denom) * dlnt
     k_imag = (-wt / denom) * dlnt
 
+    extra_real, extra_imag = [], []
     if fit_r_inf:
-        k_real = np.hstack([k_real, np.ones((len(w), 1))])
-        k_imag = np.hstack([k_imag, np.zeros((len(w), 1))])
+        extra_real.append(np.ones((len(w), 1)))
+        extra_imag.append(np.zeros((len(w), 1)))
+    if fit_ind:
+        extra_real.append(np.zeros((len(w), 2)))
+        extra_imag.append(np.column_stack([w, -w]))      # +wL and -wL branches
+    if extra_real:
+        k_real = np.hstack([k_real] + extra_real)
+        k_imag = np.hstack([k_imag] + extra_imag)
 
     A = np.vstack([k_real, k_imag])
     return A, dlnt
 
 
-def reg_matrix(m: int, order: int, has_r_inf: bool) -> np.ndarray:
+def reg_matrix(m: int, order: int, n_extra: int) -> np.ndarray:
     """Regularization (roughness) operator L acting on the g vector.
 
     order 0 -> identity  (solution norm = sqrt(sum g^2), i.e. paper Eq. 3),
-    order 1 -> first difference, order 2 -> second difference.  The R_inf
-    column (if present) is never penalised (its L column is zero)."""
+    order 1 -> first difference, order 2 -> second difference.  The `n_extra`
+    non-distribution columns (R_inf, inductance) are never penalised (their L
+    columns are zero)."""
     if order == 0:
         L = np.eye(m)
     elif order == 1:
@@ -115,8 +136,8 @@ def reg_matrix(m: int, order: int, has_r_inf: bool) -> np.ndarray:
             L[i, i + 2] = 1.0
     else:
         raise ValueError("order must be 0, 1 or 2")
-    if has_r_inf:
-        L = np.hstack([L, np.zeros((L.shape[0], 1))])    # do not penalise R_inf
+    if n_extra:
+        L = np.hstack([L, np.zeros((L.shape[0], n_extra))])
     return L
 
 
@@ -144,6 +165,7 @@ class DRTSolution:
     gamma: np.ndarray          # g(ln tau) distribution, Ohm per unit ln tau
     freq_tau: np.ndarray       # 1/(2 pi tau) — frequency axis for the DRT
     r_inf: float               # fitted ohmic offset (Ohm)
+    l_ind: float               # fitted residual series inductance (H)
     lam: float                 # regularization parameter (k_reg)
     dlnt: float                # ln-tau spacing
     z_model: np.ndarray        # reconstructed impedance at the data frequencies
@@ -161,15 +183,17 @@ def solve_drt(
     tau: np.ndarray,
     lam: float,
     order: int = 1,
-    weighting: str = "modulus",
+    weighting: str = "unit",
     fit_r_inf: bool = True,
+    fit_ind: bool = True,
 ) -> DRTSolution:
     """Solve the regularized non-negative DRT for one lambda (k_reg)."""
     freq = np.asarray(data.freq, float)
     z = data.z
-    A, dlnt = build_kernel(freq, tau, fit_r_inf=fit_r_inf)
+    A, dlnt = build_kernel(freq, tau, fit_r_inf=fit_r_inf, fit_ind=fit_ind)
     m_tau = len(tau)
-    L = reg_matrix(m_tau, order, has_r_inf=fit_r_inf)
+    n_extra = n_extra_cols(fit_r_inf, fit_ind)
+    L = reg_matrix(m_tau, order, n_extra)
 
     # row weighting (real & imag rows share the per-frequency weight)
     wrow = _row_weights(z, weighting)
@@ -185,7 +209,12 @@ def solve_drt(
     x, _ = nnls(Aa, ba, maxiter=20 * Aa.shape[1])
 
     g = x[:m_tau]
-    r_inf = float(x[m_tau]) if fit_r_inf else 0.0
+    idx = m_tau
+    r_inf = float(x[idx]) if fit_r_inf else 0.0
+    idx += 1 if fit_r_inf else 0
+    # net inductance from the +/- branch pair (angular-freq column was w, so the
+    # coefficient difference IS L in henries)
+    l_ind = float(x[idx] - x[idx + 1]) if fit_ind else 0.0
 
     z_model = A @ x                                      # stacked real/imag
     z_model = z_model[:len(freq)] + 1j * z_model[len(freq):]
@@ -200,6 +229,7 @@ def solve_drt(
         gamma=g,
         freq_tau=1.0 / (2.0 * np.pi * np.asarray(tau, float)),
         r_inf=r_inf,
+        l_ind=l_ind,
         lam=float(lam),
         dlnt=dlnt,
         z_model=z_model,
@@ -224,20 +254,25 @@ class LCurve:
 
 
 def default_lambda_grid(data: ImpedanceData, tau: np.ndarray,
-                        weighting: str = "modulus", n: int = 60,
-                        fit_r_inf: bool = True) -> np.ndarray:
+                        weighting: str = "unit", n: int = 60,
+                        fit_r_inf: bool = True, fit_ind: bool = True) -> np.ndarray:
     """A broad, data-scaled log grid of k_reg values for the L-curve.
 
-    The useful range of lambda scales with the singular values of the
-    (weighted) kernel, so the grid is centred on the largest singular value
-    and spans ~7 decades below it — wide enough to contain both the
-    over-smoothed knee and the under-smoothed vertical branch of the L curve."""
-    A, _ = build_kernel(data.freq, tau, fit_r_inf=fit_r_inf)
+    The regularization lambda*L acts ONLY on the M distribution columns, so the
+    useful lambda range scales with the singular values of the weighted
+    *distribution* submatrix — NOT the full kernel. The R_inf / inductance
+    columns are unpenalised and can have enormous magnitude (the inductance
+    column values are ~w, up to ~1e7), which would otherwise blow the grid up
+    into the fully over-smoothed regime. The grid is centred on that submatrix's
+    largest singular value and spans ~8 decades below it, covering both the
+    over-smoothed knee and the under-smoothed branch of the L curve."""
+    A, _ = build_kernel(data.freq, tau, fit_r_inf=fit_r_inf, fit_ind=fit_ind)
     wrow = _row_weights(data.z, weighting)
     W = np.concatenate([wrow, wrow])
-    s1 = np.linalg.norm(A * W[:, None], 2)               # largest singular value
+    A_dist = (A * W[:, None])[:, :len(tau)]              # distribution columns only
+    s1 = np.linalg.norm(A_dist, 2)                       # its largest singular value
     hi = np.log10(s1) + 0.5
-    lo = hi - 7.5
+    lo = hi - 8.0
     return np.logspace(lo, hi, n)
 
 
@@ -259,28 +294,24 @@ def _lcurve_curvature(rho: np.ndarray, eta: np.ndarray) -> np.ndarray:
     return kappa
 
 
-def _pick_corner(kappa: np.ndarray, eta: np.ndarray, frac: float = 0.5) -> int:
-    """Choose the L-curve corner from the curvature profile.
+def _pick_knee(rho: np.ndarray, tol: float = 0.05) -> int:
+    """Choose the operating lambda at the 'knee' of the misfit vs lambda curve.
 
-    A regularized L-curve can show two positive-curvature bumps: the genuine
-    elbow at the under/over-smoothing transition, and a spurious one far out in
-    the over-smoothed tail (where the solution has already collapsed). We take
-    every interior local maximum of the curvature that reaches at least `frac`
-    of the largest curvature, then keep the one with the SMALLEST lambda
-    (leftmost / least-smoothed) — that is the true corner. Falls back to the
-    global maximum if no interior peak qualifies."""
-    n = len(kappa)
-    valid = eta > (eta.max() * 1e-6)
-    k = np.where(valid, kappa, -np.inf)
-    kmax = np.max(kappa[1:-1]) if n > 2 else np.max(kappa)
-    if kmax <= 0:
-        return int(np.argmax(k))
-    thr = frac * kmax
-    maxima = [i for i in range(1, n - 1)
-              if k[i] >= thr and k[i] >= k[i - 1] and k[i] >= k[i + 1]]
-    if maxima:
-        return maxima[0]                                 # smallest lambda (grid ascending)
-    return int(np.argmax(k))
+    For DRT the misfit norm rho stays essentially flat at its noise floor across
+    a wide range of small lambda (the fit is insensitive to regularization until
+    lambda gets large), then rises as over-smoothing sets in. The pure L-curve
+    max-curvature corner is unreliable on this flat-misfit shape — its sharpest
+    turn sits deep in the over-smoothed branch, merging real peaks into one.
+
+    Instead we take the knee: the LARGEST lambda whose misfit is still within
+    `tol` (fractional) of the minimum misfit. This applies as much smoothing as
+    possible WITHOUT degrading the fit beyond the noise floor — i.e. it removes
+    spurious oscillations for free but stops before it starts hiding real
+    structure. `lambdas` must be ascending."""
+    rmin = float(np.min(rho))
+    thr = rmin * (1.0 + tol)
+    ok = np.where(rho <= thr)[0]
+    return int(ok.max()) if len(ok) else int(np.argmin(rho))
 
 
 def compute_lcurve(
@@ -288,18 +319,21 @@ def compute_lcurve(
     tau: np.ndarray,
     lambdas: Optional[np.ndarray] = None,
     order: int = 1,
-    weighting: str = "modulus",
+    weighting: str = "unit",
     fit_r_inf: bool = True,
+    fit_ind: bool = True,
+    knee_tol: float = 0.05,
 ) -> LCurve:
-    """Scan lambda, build the L-curve and locate its maximum-curvature corner."""
+    """Scan lambda, build the L-curve and locate its corner (misfit knee)."""
     if lambdas is None:
-        lambdas = default_lambda_grid(data, tau, weighting, fit_r_inf=fit_r_inf)
+        lambdas = default_lambda_grid(data, tau, weighting, fit_r_inf=fit_r_inf,
+                                      fit_ind=fit_ind)
     lambdas = np.sort(np.asarray(lambdas, float))
 
     sols, rho, eta = [], [], []
     for lam in lambdas:
         s = solve_drt(data, tau, lam, order=order, weighting=weighting,
-                      fit_r_inf=fit_r_inf)
+                      fit_r_inf=fit_r_inf, fit_ind=fit_ind)
         sols.append(s)
         rho.append(s.misfit_norm)
         eta.append(s.solution_norm)
@@ -307,7 +341,7 @@ def compute_lcurve(
     eta = np.array(eta)
 
     kappa = _lcurve_curvature(rho, eta)
-    i_opt = _pick_corner(kappa, eta)
+    i_opt = _pick_knee(rho, tol=knee_tol)
 
     return LCurve(
         lambdas=lambdas, rho=rho, eta=eta, curvature=kappa,
@@ -327,10 +361,17 @@ class DRTPeak:
     capacitance: float         # C = tau / R (F)
 
 
-def find_peaks(sol: DRTSolution, rel_height: float = 0.02) -> List[DRTPeak]:
+def find_peaks(sol: DRTSolution, rel_height: float = 0.05,
+               min_area_frac: float = 0.05) -> List[DRTPeak]:
     """Local maxima of g(ln tau); each peak's resistance is the trapezoidal
     integral of g over the valley-to-valley interval around it, and its
-    capacitance follows from C = tau_peak / R."""
+    capacitance follows from C = tau_peak / R.
+
+    `rel_height` drops maxima shorter than this fraction of the tallest peak;
+    `min_area_frac` then drops peaks whose integrated resistance is below this
+    fraction of the total — this suppresses the small ripples that a lightly
+    regularized (under-smoothed) solution sprinkles between the real arcs, so
+    the reported peak list reflects genuine processes, not numerical wiggles."""
     g = sol.gamma
     tau = sol.tau
     lnt = np.log(tau)
@@ -355,5 +396,11 @@ def find_peaks(sol: DRTSolution, rel_height: float = 0.02) -> List[DRTPeak]:
         C = tp / R if R > 0 else np.nan
         peaks.append(DRTPeak(tau=tp, freq=1.0 / (2.0 * np.pi * tp),
                              gamma=float(g[pi]), resistance=R, capacitance=C))
+
+    # drop numerical ripples: keep only peaks carrying a meaningful share of R
+    total_R = sum(p.resistance for p in peaks)
+    if total_R > 0 and min_area_frac > 0:
+        peaks = [p for p in peaks if p.resistance >= min_area_frac * total_R]
+
     peaks.sort(key=lambda p: p.freq, reverse=True)       # high-f first
     return peaks

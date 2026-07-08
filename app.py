@@ -172,8 +172,12 @@ with st.sidebar:
                                2: "2차 도함수 (가장 매끄러움)"}[o],
         help="0차는 논문의 solution norm=√Σγ² 과 동일. 1·2차는 더 매끄러운 분포.",
     )
-    drt_weighting = st.selectbox("DRT 가중치", ["modulus", "unit"], 0,
-                                 help="modulus=1/|Z| (EIS 표준), unit=균등")
+    drt_weighting = st.selectbox("DRT 가중치", ["unit", "modulus"], 0,
+                                 help="unit=균등 (논문 Eq.4 와 동일, 권장). "
+                                      "modulus=1/|Z| 는 저임피던스 시료에서 과평활을 유발할 수 있음.")
+    fit_ind = st.checkbox("DRT 잔여 인덕턴스 보정", True,
+                          help="L 제거 후 남은 유도성 성분을 DRT 가 직접 흡수 (권장). "
+                               "끄면 남은 인덕턴스가 과평활을 유발할 수 있습니다.")
     ppd = st.slider("τ 격자 밀도 (points/decade)", 5, 20, 10)
     ext = st.slider("τ 범위 확장 (decades, 양쪽)", 0.0, 2.0, 1.0, 0.5)
     n_lambda = st.slider("L-curve λ 스캔 개수", 20, 120, 60, 10)
@@ -318,17 +322,20 @@ st.divider()
 st.header("② L-curve 로 정규화 파라미터 $k_{reg}$ 결정")
 st.caption(
     "여러 $k_{reg}$ 에 대해 DRT 를 풀어 **solution norm η (거칠기, Eq.3)** 와 "
-    "**misfit norm ρ (데이터 편차, Eq.4)** 를 로그-로그로 그립니다. "
-    "**꺾인 모서리(최대 곡률)** 가 과평활–과적합의 균형점 = 최적 $k_{reg}$ 입니다."
+    "**misfit norm ρ (데이터 편차, Eq.4)** 를 로그-로그로 그립니다(왼쪽). "
+    "최적 $k_{reg}$ 는 **misfit 이 잡음 바닥에서 벗어나기 직전(모서리)** — 즉 피팅 품질을 "
+    "떨어뜨리지 않으면서 최대한 매끄럽게 만드는 지점입니다(오른쪽에서 확인). "
+    "이렇게 하면 EIS-DRT 특유의 *평평한 misfit* 에서도 과평활 없이 실제 피크가 분리됩니다."
 )
 
 tau = make_tau_grid(dcorr.freq, ppd=int(ppd), extend_decades=float(ext))
-lc_sig = (sig, int(reg_order), drt_weighting, int(ppd), float(ext), int(n_lambda))
+lc_sig = (sig, int(reg_order), drt_weighting, bool(fit_ind), int(ppd), float(ext), int(n_lambda))
 if st.session_state.get("lcurve") is None or st.session_state.get("lc_sig") != lc_sig:
     with st.spinner(f"L-curve 계산 중... ({n_lambda}개 λ 스캔)"):
-        lams = default_lambda_grid(dcorr, tau, weighting=drt_weighting, n=int(n_lambda))
+        lams = default_lambda_grid(dcorr, tau, weighting=drt_weighting, n=int(n_lambda),
+                                   fit_ind=fit_ind)
         lc = compute_lcurve(dcorr, tau, lambdas=lams, order=int(reg_order),
-                            weighting=drt_weighting)
+                            weighting=drt_weighting, fit_ind=fit_ind)
     st.session_state["lcurve"] = lc
     st.session_state["lc_sig"] = lc_sig
 lc = st.session_state["lcurve"]
@@ -336,19 +343,22 @@ lc = st.session_state["lcurve"]
 cL, cR = st.columns([1, 1])
 with cL:
     st.plotly_chart(lcurve_fig(lc), use_container_width=True, config=PLOT_CONFIG)
-    st.metric("최적 k_reg (L-curve corner)", f"{lc.lam_opt:.4g}")
+    st.metric("최적 k_reg (L-curve 모서리)", f"{lc.lam_opt:.4g}")
 with cR:
-    # curvature vs lambda, corner marked
+    # misfit norm vs k_reg with the noise floor and the chosen knee marked
+    rho_min = float(np.min(lc.rho))
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=lc.lambdas, y=lc.curvature, mode="lines+markers",
-                             line=dict(color="#9467bd"), name="곡률"))
-    fig.add_trace(go.Scatter(x=[lc.lam_opt], y=[lc.curvature[lc.i_opt]],
+    fig.add_trace(go.Scatter(x=lc.lambdas, y=lc.rho, mode="lines+markers",
+                             line=dict(color="#9467bd"), name="misfit ρ"))
+    fig.add_hline(y=rho_min, line=dict(color="#888", dash="dot"),
+                  annotation_text="잡음 바닥", annotation_position="bottom left")
+    fig.add_trace(go.Scatter(x=[lc.lam_opt], y=[lc.rho[lc.i_opt]],
                              mode="markers", marker=dict(color="#d62728", size=13, symbol="star"),
-                             name="corner"))
+                             name="선택된 k_reg"))
     fig.update_layout(height=460, margin=dict(l=60, r=20, t=10, b=50),
                       legend=dict(orientation="h", y=1.0))
     fig.update_xaxes(type="log", title_text="k_reg", showgrid=True)
-    fig.update_yaxes(title_text="L-curve 곡률", showgrid=True)
+    fig.update_yaxes(type="log", title_text="misfit norm ρ", showgrid=True)
     st.plotly_chart(fig, use_container_width=True, config=PLOT_CONFIG)
 
 
@@ -371,8 +381,10 @@ with c2:
 lam_user = lc.lam_opt * (10.0 ** log_mult)
 st.markdown(f"현재 $k_{{reg}}$ = **{lam_user:.4g}**  (최적값 {lc.lam_opt:.4g} × 10^{log_mult:+.1f})")
 
-sol = solve_drt(dcorr, tau, lam_user, order=int(reg_order), weighting=drt_weighting)
-sol_opt = solve_drt(dcorr, tau, lc.lam_opt, order=int(reg_order), weighting=drt_weighting)
+sol = solve_drt(dcorr, tau, lam_user, order=int(reg_order), weighting=drt_weighting,
+                fit_ind=fit_ind)
+sol_opt = solve_drt(dcorr, tau, lc.lam_opt, order=int(reg_order), weighting=drt_weighting,
+                    fit_ind=fit_ind)
 
 cD, cE = st.columns(2)
 with cD:
@@ -388,10 +400,12 @@ with cE:
     st.plotly_chart(nyquist_fig(tr), use_container_width=True, config=PLOT_CONFIG)
 
 rel = np.linalg.norm(sol.z_model - dcorr.z) / np.linalg.norm(dcorr.z) * 100
-mm1, mm2, mm3 = st.columns(3)
+mm1, mm2, mm3, mm4 = st.columns(4)
 mm1.metric("R_∞ (오믹, Ω)", f"{sol.r_inf:.5g}")
 mm2.metric("R_pol (분포 면적, Ω)", f"{sol.r_pol:.5g}")
 mm3.metric("재구성 상대오차", f"{rel:.3f} %")
+mm4.metric("DRT 잔여 L (H)", f"{sol.l_ind:.3g}" if fit_ind else "—",
+           help="L 제거 후에도 남아 DRT 가 흡수한 유도성 성분")
 
 # --- peaks ----------------------------------------------------------------- #
 peaks = find_peaks(sol)

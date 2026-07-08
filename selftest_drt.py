@@ -64,8 +64,8 @@ def main():
 
     # 2) DRT L-curve ------------------------------------------------------ #
     tau = make_tau_grid(dcorr.freq, ppd=10, extend_decades=1.0)
-    lams = default_lambda_grid(dcorr, tau, weighting="modulus")
-    lc = compute_lcurve(dcorr, tau, lambdas=lams, order=1, weighting="modulus")
+    lams = default_lambda_grid(dcorr, tau, weighting="unit")
+    lc = compute_lcurve(dcorr, tau, lambdas=lams, order=1, weighting="unit")
     print(f"tau grid: {len(tau)} pts, {tau.min():.2e} .. {tau.max():.2e} s")
     print(f"L-curve: scanned {len(lams)} lambda in "
           f"[{lams.min():.2e}, {lams.max():.2e}], corner k_reg = {lc.lam_opt:.3e} "
@@ -74,7 +74,7 @@ def main():
     corner_interior = 0 < lc.i_opt < len(lams) - 1
 
     # 3) solution at the corner ------------------------------------------ #
-    sol = solve_drt(dcorr, tau, lc.lam_opt, order=1, weighting="modulus")
+    sol = solve_drt(dcorr, tau, lc.lam_opt, order=1, weighting="unit")
 
     # reconstruction quality vs the L-corrected data
     zrec = sol.z_model
