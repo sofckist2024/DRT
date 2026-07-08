@@ -154,7 +154,12 @@ with st.sidebar:
     st.header("2. 회로 / 인덕턴스")
     n_elem = st.number_input("(R-CPE) element 개수", 1, 8, 2, 1,
                              help="L 추출용 등가회로 Rs-(R-CPE)×N 의 원소 개수")
-    fit_weighting = st.selectbox("피팅 가중치", ["modulus", "proportional", "unit"], 0)
+    fit_weighting = st.selectbox("피팅 가중치", ["modulus", "proportional", "unit"], 0,
+                                 help="저임피던스 시료에서 아크가 처지면 'unit' 을 시도해 보세요.")
+    precision = st.select_slider(
+        "피팅 정밀도 (속도)", ["빠르게", "보통", "정밀"], value="보통",
+        help="다중 시작 횟수. 원소 수가 많으면 '정밀'은 느려집니다.",
+    )
     auto_hf = st.checkbox("고주파 꼬임 구간 자동 제외", True,
                           help="인덕턴스 꼬리에서 수직선을 벗어나 도는 고주파 이상점을 제외")
     hf_tol = st.slider("수직 판정 허용폭 (%)", 1, 30, 8, disabled=not auto_hf) / 100.0
@@ -211,17 +216,46 @@ if excl.any():
     st.warning(f"고주파 꼬임 **{int(excl.sum())}점** 제외 (f ≥ {data.freq[excl].min():.3g} Hz). "
                f"남은 {len(data_fit)}점으로 진행합니다.")
 
+# --- raw data preview (shown immediately, before any fitting) --------------- #
+st.subheader("업로드한 데이터")
+pv1, pv2 = st.columns(2)
+with pv1:
+    st.markdown("**Nyquist**")
+    tr = [("data (피팅 대상)", data_fit.z_real, data_fit.z_imag, data_fit.freq, "#1f77b4", False)]
+    if excl.any():
+        tr.append(("제외 (고주파 꼬임)", data.z_real[excl], data.z_imag[excl],
+                   data.freq[excl], "#999999", False, "x"))
+    st.plotly_chart(nyquist_fig(tr), use_container_width=True, config=PLOT_CONFIG)
+with pv2:
+    st.markdown("**Bode**")
+    ser = [("data (피팅 대상)", data_fit.freq, data_fit.z, "#1f77b4", False)]
+    if excl.any():
+        ser.append(("제외 (고주파 꼬임)", data.freq[excl], data.z[excl], "#999999", False, "x"))
+    st.plotly_chart(bode_fig(ser), use_container_width=True, config=PLOT_CONFIG)
+
 
 # --------------------------------------------------------------------------- #
 #  Step A — circuit fit + inductance removal
 # --------------------------------------------------------------------------- #
 st.divider()
 st.header("① 등가회로 피팅 → 인덕턴스(L) 제거")
+st.caption(
+    "이 피팅의 **목적은 직렬 인덕턴스 $L$ 추출**입니다. DRT 는 아래에서 얻는 "
+    "**‘L 제거 data’(초록)** 로 수행되며, 회로 모델 곡선(빨강)은 참고용입니다 — "
+    "저임피던스·다중 아크 시료에서는 아크가 다소 어긋날 수 있으나, $L$ 값과 "
+    "L 제거 데이터는 그 영향을 받지 않습니다. 아크를 더 맞추려면 (R-CPE) 개수나 "
+    "가중치를 조절하세요."
+)
 
 run = st.button("피팅 + L 제거 실행 ▶", type="primary")
 if run:
-    with st.spinner("등가회로 피팅 중..."):
-        fit = fit_impedance(data_fit, int(n_elem), weighting=fit_weighting)
+    # multi-start count: scaled down for higher element counts so the fit stays
+    # fast (fit time grows steeply with n_elem × n_starts)
+    base = {"빠르게": 6, "보통": 12, "정밀": 24}[precision]
+    n_starts = max(4, base // max(1, int(n_elem) - 1))
+    with st.spinner(f"등가회로 피팅 중... (다중 시작 {n_starts}회)"):
+        fit = fit_impedance(data_fit, int(n_elem), weighting=fit_weighting,
+                            n_starts=n_starts)
         corr = remove_inductance(data_fit, fit, weighting=fit_weighting)
     st.session_state["fit"] = fit
     st.session_state["corr"] = corr
@@ -246,11 +280,17 @@ if fit is None:
 
 dcorr = corr.data_corr
 
+fit_resid = np.linalg.norm(fit.z_fit - data_fit.z) / np.linalg.norm(data_fit.z) * 100
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("제거한 L (H)", f"{corr.L:.4g}")
 m2.metric("Rs · 오믹 (Ω)", f"{corr.Rs:.5g}")
 m3.metric("Rp 합계 (Ω)", f"{corr.Rp_total:.5g}")
-m4.metric("χ²/dof", f"{fit.chi_square_reduced:.3g}")
+m4.metric("회로 피팅 잔차", f"{fit_resid:.2f} %",
+          help="회로 모델과 데이터의 상대 오차. 크면 (R-CPE) 개수·가중치를 조절하세요.")
+if fit_resid > 5:
+    st.info(f"회로 모델 아크가 데이터와 {fit_resid:.1f}% 어긋납니다. "
+            "**(R-CPE) 개수를 늘리거나** 가중치를 'unit' 으로 바꿔 보세요. "
+            "단, DRT 는 아래 초록색 **L 제거 data** 로 수행되므로 이 오차의 영향을 받지 않습니다.")
 
 cA, cB = st.columns(2)
 with cA:
@@ -258,15 +298,16 @@ with cA:
     f_dense = np.logspace(np.log10(dcorr.freq.min()), np.log10(dcorr.freq.max()), 400)
     mp = corr.fit.params.copy(); mp[0] = 0.0
     z_model = circuit_impedance(mp, f_dense, corr.fit.n_elem)
-    tr = [("원본 data", data_fit.z_real, data_fit.z_imag, data_fit.freq, "#1f77b4", False),
-          ("L 제거 data", dcorr.z_real, dcorr.z_imag, dcorr.freq, "#2ca02c", False, "diamond"),
-          ("L 제거 모델", z_model.real, z_model.imag, f_dense, "#d62728", True)]
+    # foreground the two DATA curves (always consistent); model is a faint reference
+    tr = [("L 제거 모델 (참고)", z_model.real, z_model.imag, f_dense, "#f4a58a", True),
+          ("원본 data", data_fit.z_real, data_fit.z_imag, data_fit.freq, "#1f77b4", False),
+          ("L 제거 data (DRT 입력)", dcorr.z_real, dcorr.z_imag, dcorr.freq, "#2ca02c", False, "diamond")]
     st.plotly_chart(nyquist_fig(tr), use_container_width=True, config=PLOT_CONFIG)
 with cB:
     st.markdown("**Bode — 인덕턴스 제거 전/후**")
-    ser = [("원본 data", data_fit.freq, data_fit.z, "#1f77b4", False),
-           ("L 제거 data", dcorr.freq, dcorr.z, "#2ca02c", False, "diamond"),
-           ("L 제거 모델", f_dense, z_model, "#d62728", True)]
+    ser = [("L 제거 모델 (참고)", f_dense, z_model, "#f4a58a", True),
+           ("원본 data", data_fit.freq, data_fit.z, "#1f77b4", False),
+           ("L 제거 data (DRT 입력)", dcorr.freq, dcorr.z, "#2ca02c", False, "diamond")]
     st.plotly_chart(bode_fig(ser), use_container_width=True, config=PLOT_CONFIG)
 
 
