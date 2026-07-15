@@ -30,6 +30,17 @@ from drt import (
 
 st.set_page_config(page_title="DRT 분석", layout="wide")
 
+# attribution, top-right of the page (Streamlit has no native header slot, so a
+# right-aligned block is placed above the title)
+st.markdown(
+    "<div style='text-align:right; font-size:0.85rem; line-height:1.4; "
+    "opacity:0.75; margin-top:-0.75rem; margin-bottom:0.25rem;'>"
+    "Produced by <b>Kyung Joong Yoon</b><br>"
+    "<span style='font-size:0.8rem;'>[Korea Institute of Science &amp; Technology]</span>"
+    "</div>",
+    unsafe_allow_html=True,
+)
+
 st.title("DRT 분석 (Distribution of Relaxation Times)")
 st.markdown(
     "임피던스 스펙트럼을 **등가회로 Rs–(R₁-CPE₁)–(R₂-CPE₂)–…** 로 피팅해 직렬 "
