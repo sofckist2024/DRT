@@ -13,6 +13,10 @@ Pipeline (based on Choi et al., JOM 71, 3825 (2019)):
 Run with:   streamlit run app.py
 """
 
+import io
+import zipfile
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -156,6 +160,30 @@ def lcurve_fig(lc, height=460):
 
 
 # --------------------------------------------------------------------------- #
+#  Source-code download (zips the app's own .py files at runtime)
+# --------------------------------------------------------------------------- #
+SOURCE_FILES = [
+    "app.py", "drt.py", "impedance_fit.py",
+    "selftest_drt.py", "run_drt.py", "requirements.txt", "README.md",
+]
+
+
+@st.cache_data
+def build_source_zip() -> bytes:
+    """Bundle the program's own source files (those that exist) into a zip so a
+    visitor of the deployed app can download the full source. Missing files are
+    skipped, so this works whether or not every optional file was deployed."""
+    here = Path(__file__).resolve().parent
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in SOURCE_FILES:
+            p = here / name
+            if p.exists():
+                zf.write(p, arcname=f"DRT/{name}")
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
 #  Sidebar
 # --------------------------------------------------------------------------- #
 with st.sidebar:
@@ -192,6 +220,18 @@ with st.sidebar:
     ppd = st.slider("τ 격자 밀도 (points/decade)", 5, 20, 10)
     ext = st.slider("τ 범위 확장 (decades, 양쪽)", 0.0, 2.0, 1.0, 0.5)
     n_lambda = st.slider("L-curve λ 스캔 개수", 20, 120, 60, 10)
+
+    st.divider()
+    st.caption("소스 코드")
+    st.download_button(
+        "📥 소스 코드 다운로드 (.zip)",
+        data=build_source_zip(),
+        file_name="DRT_source.zip",
+        mime="application/zip",
+        use_container_width=True,
+        help="이 프로그램의 Python 소스 파일(app.py, drt.py, impedance_fit.py 등)을 "
+             "zip 으로 내려받습니다.",
+    )
 
 if up is None:
     st.info("좌측에서 ZView `.z` 파일(또는 freq, Z', Z'' 텍스트 파일)을 업로드하세요.")
